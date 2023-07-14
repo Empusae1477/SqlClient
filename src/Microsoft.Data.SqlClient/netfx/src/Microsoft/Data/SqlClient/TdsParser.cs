@@ -964,7 +964,7 @@ namespace Microsoft.Data.SqlClient
             {
                 session = _sessionPool.GetSession(owner);
 
-                Debug.Assert(!session._pendingData, "pending data on a pooled MARS session");
+                Debug.Assert(!session.HasPendingData, "pending data on a pooled MARS session");
                 SqlClientEventSource.Log.TryAdvancedTraceEvent("<sc.TdsParser.GetSession|ADV> {0} getting session {1} from pool", ObjectID, session.ObjectID);
             }
             else
@@ -1487,7 +1487,10 @@ namespace Microsoft.Data.SqlClient
                             }
 
                             // Validate Certificate if Trust Server Certificate=false and Encryption forced (EncryptionOptions.ON) from Server.
-                            bool shouldValidateServerCert = (_encryptionOption == EncryptionOptions.ON && !trustServerCert) || ((authType != SqlAuthenticationMethod.NotSpecified || _connHandler._accessTokenInBytes != null) && !trustServerCert);
+                             bool shouldValidateServerCert = (_encryptionOption == EncryptionOptions.ON && !trustServerCert) ||
+                             ((authType != SqlAuthenticationMethod.NotSpecified || (_connHandler._accessTokenInBytes != null || 
+                            _connHandler._accessTokenCallback != null))
+                            && !trustServerCert);
 
                             UInt32 info = (shouldValidateServerCert ? TdsEnums.SNI_SSL_VALIDATE_CERTIFICATE : 0)
                                 | (is2005OrLater && (_encryptionOption & EncryptionOptions.CLIENT_CERT) == 0 ? TdsEnums.SNI_SSL_USE_SCHANNEL_CACHE : 0);
@@ -1551,7 +1554,7 @@ namespace Microsoft.Data.SqlClient
                         // Or AccessToken is not null, mean token based authentication is used.
                         if ((_connHandler.ConnectionOptions != null
                             && _connHandler.ConnectionOptions.Authentication != SqlAuthenticationMethod.NotSpecified)
-                            || _connHandler._accessTokenInBytes != null)
+                            || _connHandler._accessTokenInBytes != null || _connHandler._accessTokenCallback != null)
                         {
                             fedAuthRequired = payload[payloadOffset] == 0x01 ? true : false;
                         }
@@ -1598,7 +1601,7 @@ namespace Microsoft.Data.SqlClient
 
             if (!connectionIsDoomed && null != _physicalStateObj)
             {
-                if (_physicalStateObj._pendingData)
+                if (_physicalStateObj.HasPendingData)
                 {
                     DrainData(_physicalStateObj);
                 }
@@ -3024,18 +3027,18 @@ namespace Microsoft.Data.SqlClient
                         break;
                 }
 
-                Debug.Assert(stateObj._pendingData || !dataReady, "dataReady is set, but there is no pending data");
+                Debug.Assert(stateObj.HasPendingData || !dataReady, "dataReady is set, but there is no pending data");
             }
 
             // Loop while data pending & runbehavior not return immediately, OR
             // if in attention case, loop while no more pending data & attention has not yet been
             // received.
-            while ((stateObj._pendingData &&
+            while ((stateObj.HasPendingData &&
                     (RunBehavior.ReturnImmediately != (RunBehavior.ReturnImmediately & runBehavior))) ||
-                (!stateObj._pendingData && stateObj._attentionSent && !stateObj._attentionReceived));
+                (!stateObj.HasPendingData && stateObj._attentionSent && !stateObj.HasReceivedAttention));
 
 #if DEBUG
-            if ((stateObj._pendingData) && (!dataReady))
+            if ((stateObj.HasPendingData) && (!dataReady))
             {
                 byte token;
                 if (!stateObj.TryPeekByte(out token))
@@ -3046,7 +3049,7 @@ namespace Microsoft.Data.SqlClient
             }
 #endif
 
-            if (!stateObj._pendingData)
+            if (!stateObj.HasPendingData)
             {
                 if (null != CurrentTransaction)
                 {
@@ -3056,7 +3059,7 @@ namespace Microsoft.Data.SqlClient
 
             // if we recieved an attention (but this thread didn't send it) then
             // we throw an Operation Cancelled error
-            if (stateObj._attentionReceived)
+            if (stateObj.HasReceivedAttention)
             {
                 // Dev11 #344723: SqlClient stress test suspends System_Data!Tcp::ReadSync via a call to SqlDataReader::Close
                 // Spin until SendAttention has cleared _attentionSending, this prevents a race condition between receiving the attention ACK and setting _attentionSent
@@ -3067,7 +3070,7 @@ namespace Microsoft.Data.SqlClient
                 {
                     // Reset attention state.
                     stateObj._attentionSent = false;
-                    stateObj._attentionReceived = false;
+                    stateObj.HasReceivedAttention = false;
 
                     if (RunBehavior.Clean != (RunBehavior.Clean & runBehavior) && !stateObj.IsTimeoutStateExpired)
                     {
@@ -3533,7 +3536,7 @@ namespace Microsoft.Data.SqlClient
             {
                 Debug.Assert(TdsEnums.DONE_MORE != (status & TdsEnums.DONE_MORE), "Not expecting DONE_MORE when receiving DONE_ATTN");
                 Debug.Assert(stateObj._attentionSent, "Received attention done without sending one!");
-                stateObj._attentionReceived = true;
+                stateObj.HasReceivedAttention = true;
                 Debug.Assert(stateObj._inBytesUsed == stateObj._inBytesRead && stateObj._inBytesPacket == 0, "DONE_ATTN received with more data left on wire");
             }
             if ((null != cmd) && (TdsEnums.DONE_COUNT == (status & TdsEnums.DONE_COUNT)))
@@ -3604,14 +3607,14 @@ namespace Microsoft.Data.SqlClient
                 stateObj._errorTokenReceived = false;
                 if (stateObj._inBytesUsed >= stateObj._inBytesRead)
                 {
-                    stateObj._pendingData = false;
+                    stateObj.HasPendingData = false;
                 }
             }
 
             // _pendingData set by e.g. 'TdsExecuteSQLBatch'
             // _hasOpenResult always set to true by 'WriteMarsHeader'
             //
-            if (!stateObj._pendingData && stateObj._hasOpenResult)
+            if (!stateObj.HasPendingData && stateObj._hasOpenResult)
             {
                 /*
                                 Debug.Assert(!((sqlTransaction != null               && _distributedTransaction != null) ||
@@ -5159,7 +5162,7 @@ namespace Microsoft.Data.SqlClient
             {
                 DrainData(stateObj);
 
-                stateObj._pendingData = false;
+                stateObj.HasPendingData = false;
             }
 
             ThrowExceptionAndWarning(stateObj);
@@ -6903,6 +6906,13 @@ namespace Microsoft.Data.SqlClient
                         }
                         catch (Exception e)
                         {
+                            if (stateObj is not null)
+                            {
+                                // call to decrypt column keys has failed. The data wont be decrypted.
+                                // Not setting the value to false, forces the driver to look for column value.
+                                // Packet received from Key Vault will throws invalid token header.
+                                stateObj.HasPendingData = false;
+                            }
                             throw SQL.ColumnDecryptionFailed(columnName, null, e);
                         }
                     }
@@ -8756,7 +8766,14 @@ namespace Microsoft.Data.SqlClient
                                 workflow = TdsEnums.MSALWORKFLOW_ACTIVEDIRECTORYDEFAULT;
                                 break;
                             default:
-                                Debug.Assert(false, "Unrecognized Authentication type for fedauth MSAL request");
+                                if (_connHandler._accessTokenCallback != null)
+                                {
+                                    workflow = TdsEnums.MSALWORKFLOW_ACTIVEDIRECTORYTOKENCREDENTIAL;
+                                }
+                                else
+                                {
+                                    Debug.Assert(false, "Unrecognized Authentication type for fedauth MSAL request");
+                                }
                                 break;
                         }
 
@@ -9004,7 +9021,7 @@ namespace Microsoft.Data.SqlClient
                     Debug.Assert(SniContext.Snix_Login == _physicalStateObj.SniContext, $"Unexpected SniContext. Expecting Snix_Login, actual value is '{_physicalStateObj.SniContext}'");
                     _physicalStateObj.SniContext = SniContext.Snix_LoginSspi;
                     SSPIData(null, 0, outSSPIBuff, ref outSSPILength);
-                    if (outSSPILength > Int32.MaxValue)
+                    if (outSSPILength > int.MaxValue)
                     {
                         throw SQL.InvalidSSPIPacketSize();  // SqlBu 332503
                     }
@@ -9012,56 +9029,74 @@ namespace Microsoft.Data.SqlClient
 
                     checked
                     {
-                        length += (Int32)outSSPILength;
+                        length += (int)outSSPILength;
                     }
                 }
             }
 
             int feOffset = length;
+            // calculate and reserve the required bytes for the featureEx
+            length = ApplyFeatureExData(requestedFeatures, recoverySessionData, fedAuthFeatureExtensionData, useFeatureExt, length);
 
-            if (useFeatureExt)
+            WriteLoginData(rec,
+                           requestedFeatures,
+                           recoverySessionData,
+                           fedAuthFeatureExtensionData,
+                           encrypt,
+                           encryptedPassword,
+                           encryptedChangePassword,
+                           encryptedPasswordLengthInBytes,
+                           encryptedChangePasswordLengthInBytes,
+                           useFeatureExt,
+                           userName,
+                           length,
+                           feOffset,
+                           clientInterfaceName,
+                           outSSPIBuff,
+                           outSSPILength);
+
+            _physicalStateObj.WritePacket(TdsEnums.HARDFLUSH);
+            _physicalStateObj.ResetSecurePasswordsInformation();     // Password information is needed only from Login process; done with writing login packet and should clear information
+            _physicalStateObj.HasPendingData = true;
+            _physicalStateObj._messageStatus = 0;
+
+            // Remvove CTAIP Provider after login record is sent.
+            //
+            if (originalNetworkAddressInfo != null)
             {
-                checked
+                UInt32 error = SNINativeMethodWrapper.SNIRemoveProvider(_physicalStateObj.Handle, SNINativeMethodWrapper.ProviderEnum.CTAIP_PROV);
+                if (error != TdsEnums.SNI_SUCCESS)
                 {
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.SessionRecovery) != 0)
-                    {
-                        length += WriteSessionRecoveryFeatureRequest(recoverySessionData, false);
-                    };
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.FedAuth) != 0)
-                    {
-                        Debug.Assert(fedAuthFeatureExtensionData != null, "fedAuthFeatureExtensionData should not null.");
-                        length += WriteFedAuthFeatureRequest(fedAuthFeatureExtensionData, write: false);
-                    }
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.Tce) != 0)
-                    {
-                        length += WriteTceFeatureRequest(false);
-                    }
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.GlobalTransactions) != 0)
-                    {
-                        length += WriteGlobalTransactionsFeatureRequest(false);
-                    }
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.AzureSQLSupport) != 0)
-                    {
-                        length += WriteAzureSQLSupportFeatureRequest(false);
-                    }
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.DataClassification) != 0)
-                    {
-                        length += WriteDataClassificationFeatureRequest(false);
-                    }
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.UTF8Support) != 0)
-                    {
-                        length += WriteUTF8SupportFeatureRequest(false);
-                    }
+                    _physicalStateObj.AddError(ProcessSNIError(_physicalStateObj));
+                    ThrowExceptionAndWarning(_physicalStateObj);
+                }
 
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.SQLDNSCaching) != 0)
-                    {
-                        length += WriteSQLDNSCachingFeatureRequest(false);
-                    }
-
-                    length++; // for terminator
+                try
+                { } // EmptyTry/Finally to avoid FXCop violation
+                finally
+                {
+                    _physicalStateObj.ClearAllWritePackets();
                 }
             }
+        }// tdsLogin
 
+        private void WriteLoginData(SqlLogin rec,
+                                    TdsEnums.FeatureExtension requestedFeatures,
+                                    SessionData recoverySessionData,
+                                    FederatedAuthenticationFeatureExtensionData fedAuthFeatureExtensionData,
+                                    SqlConnectionEncryptOption encrypt,
+                                    byte[] encryptedPassword,
+                                    byte[] encryptedChangePassword,
+                                    int encryptedPasswordLengthInBytes,
+                                    int encryptedChangePasswordLengthInBytes,
+                                    bool useFeatureExt,
+                                    string userName,
+                                    int length,
+                                    int featureExOffset,
+                                    string clientInterfaceName,
+                                    byte[] outSSPIBuff,
+                                    uint outSSPILength)
+        {
             try
             {
                 WriteInt(length, _physicalStateObj);
@@ -9277,7 +9312,12 @@ namespace Microsoft.Data.SqlClient
                 // write ibFeatureExtLong
                 if (useFeatureExt)
                 {
-                    WriteInt(feOffset, _physicalStateObj);
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.FedAuth) != 0)
+                    {
+                        SqlClientEventSource.Log.TryTraceEvent("<sc.TdsParser.TdsLogin|SEC> Sending federated authentication feature request");
+                    }
+
+                    WriteInt(featureExOffset, _physicalStateObj);
                 }
 
                 WriteString(clientInterfaceName, _physicalStateObj);
@@ -9304,46 +9344,7 @@ namespace Microsoft.Data.SqlClient
                     }
                 }
 
-                if (useFeatureExt)
-                {
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.SessionRecovery) != 0)
-                    {
-                        WriteSessionRecoveryFeatureRequest(recoverySessionData, true);
-                    };
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.FedAuth) != 0)
-                    {
-                        SqlClientEventSource.Log.TryTraceEvent("<sc.TdsParser.TdsLogin|SEC> Sending federated authentication feature request");
-                        Debug.Assert(fedAuthFeatureExtensionData != null, "fedAuthFeatureExtensionData should not null.");
-                        WriteFedAuthFeatureRequest(fedAuthFeatureExtensionData, write: true);
-                    };
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.Tce) != 0)
-                    {
-                        WriteTceFeatureRequest(true);
-                    };
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.GlobalTransactions) != 0)
-                    {
-                        WriteGlobalTransactionsFeatureRequest(true);
-                    };
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.AzureSQLSupport) != 0)
-                    {
-                        WriteAzureSQLSupportFeatureRequest(true);
-                    }
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.DataClassification) != 0)
-                    {
-                        WriteDataClassificationFeatureRequest(true);
-                    }
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.UTF8Support) != 0)
-                    {
-                        WriteUTF8SupportFeatureRequest(true);
-                    }
-
-                    if ((requestedFeatures & TdsEnums.FeatureExtension.SQLDNSCaching) != 0)
-                    {
-                        WriteSQLDNSCachingFeatureRequest(true);
-                    }
-
-                    _physicalStateObj.WriteByte(0xFF); // terminator
-                }
+                ApplyFeatureExData(requestedFeatures, recoverySessionData, fedAuthFeatureExtensionData, useFeatureExt, length, true);
             } // try
             catch (Exception e)
             {
@@ -9357,31 +9358,65 @@ namespace Microsoft.Data.SqlClient
 
                 throw;
             }
+        }
 
-            _physicalStateObj.WritePacket(TdsEnums.HARDFLUSH);
-            _physicalStateObj.ResetSecurePasswordsInfomation();     // Password information is needed only from Login process; done with writing login packet and should clear information
-            _physicalStateObj._pendingData = true;
-            _physicalStateObj._messageStatus = 0;
-
-            // Remvove CTAIP Provider after login record is sent.
-            //
-            if (originalNetworkAddressInfo != null)
+        private int ApplyFeatureExData(TdsEnums.FeatureExtension requestedFeatures,
+                                       SessionData recoverySessionData,
+                                       FederatedAuthenticationFeatureExtensionData fedAuthFeatureExtensionData,
+                                       bool useFeatureExt,
+                                       int length,
+                                       bool write = false)
+        {
+            if (useFeatureExt)
             {
-                UInt32 error = SNINativeMethodWrapper.SNIRemoveProvider(_physicalStateObj.Handle, SNINativeMethodWrapper.ProviderEnum.CTAIP_PROV);
-                if (error != TdsEnums.SNI_SUCCESS)
+                checked
                 {
-                    _physicalStateObj.AddError(ProcessSNIError(_physicalStateObj));
-                    ThrowExceptionAndWarning(_physicalStateObj);
-                }
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.SessionRecovery) != 0)
+                    {
+                        length += WriteSessionRecoveryFeatureRequest(recoverySessionData, write);
+                    };
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.FedAuth) != 0)
+                    {
+                        SqlClientEventSource.Log.TryTraceEvent("<sc.TdsParser.TdsLogin|SEC> Sending federated authentication feature request & wirte = {0}", write);
+                        Debug.Assert(fedAuthFeatureExtensionData != null, "fedAuthFeatureExtensionData should not null.");
+                        length += WriteFedAuthFeatureRequest(fedAuthFeatureExtensionData, write: write);
+                    }
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.Tce) != 0)
+                    {
+                        length += WriteTceFeatureRequest(write);
+                    }
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.GlobalTransactions) != 0)
+                    {
+                        length += WriteGlobalTransactionsFeatureRequest(write);
+                    }
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.AzureSQLSupport) != 0)
+                    {
+                        length += WriteAzureSQLSupportFeatureRequest(write);
+                    }
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.DataClassification) != 0)
+                    {
+                        length += WriteDataClassificationFeatureRequest(write);
+                    }
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.UTF8Support) != 0)
+                    {
+                        length += WriteUTF8SupportFeatureRequest(write);
+                    }
 
-                try
-                { } // EmptyTry/Finally to avoid FXCop violation
-                finally
-                {
-                    _physicalStateObj.ClearAllWritePackets();
+                    if ((requestedFeatures & TdsEnums.FeatureExtension.SQLDNSCaching) != 0)
+                    {
+                        length += WriteSQLDNSCachingFeatureRequest(write);
+                    }
+
+                    length++; // for terminator
+                    if (write)
+                    {
+                        _physicalStateObj.WriteByte(0xFF); // terminator
+                    }
                 }
             }
-        }// tdsLogin
+
+            return length;
+        }
 
         /// <summary>
         /// Send the access token to the server.
@@ -9408,7 +9443,7 @@ namespace Microsoft.Data.SqlClient
             _physicalStateObj.WriteByteArray(accessToken, accessToken.Length, 0);
 
             _physicalStateObj.WritePacket(TdsEnums.HARDFLUSH);
-            _physicalStateObj._pendingData = true;
+            _physicalStateObj.HasPendingData = true;
             _physicalStateObj._messageStatus = 0;
 
             _connHandler._federatedAuthenticationRequested = true;
@@ -9720,7 +9755,7 @@ namespace Microsoft.Data.SqlClient
 
                 Task writeTask = stateObj.WritePacket(TdsEnums.HARDFLUSH);
                 Debug.Assert(writeTask == null, "Writes should not pend when writing sync");
-                stateObj._pendingData = true;
+                stateObj.HasPendingData = true;
                 stateObj._messageStatus = 0;
 
                 SqlDataReader dtcReader = null;
@@ -10036,10 +10071,10 @@ namespace Microsoft.Data.SqlClient
 
                             // Options
                             WriteShort((short)rpcext.options, stateObj);
-                        }
 
-                        byte[] enclavePackage = cmd.enclavePackage != null ? cmd.enclavePackage.EnclavePackageBytes : null;
-                        WriteEnclaveInfo(stateObj, enclavePackage);
+                            byte[] enclavePackage = cmd.enclavePackage != null ? cmd.enclavePackage.EnclavePackageBytes : null;
+                            WriteEnclaveInfo(stateObj, enclavePackage);
+                        }
 
                         // Stream out parameters
                         int parametersLength = rpcext.userParamCount + rpcext.systemParamCount;
@@ -10122,7 +10157,7 @@ namespace Microsoft.Data.SqlClient
                                 }
                             }
 
-                            WriteParameterName(param.ParameterNameFixed, stateObj, enableOptimizedParameterBinding);
+                            WriteParameterName(param.ParameterName, stateObj, enableOptimizedParameterBinding);
 
                             // Write parameter status
                             stateObj.WriteByte(options);
@@ -10803,17 +10838,34 @@ namespace Microsoft.Data.SqlClient
             }
         }
 
-
-        private void WriteParameterName(string parameterName, TdsParserStateObject stateObj, bool isAnonymous)
+        /// <summary>
+        /// Will check the parameter name for the required @ prefix and then write the correct prefixed
+        /// form and correct character length to the output buffer
+        /// </summary>
+        private void WriteParameterName(string rawParameterName, TdsParserStateObject stateObj, bool isAnonymous)
         {
             // paramLen
             // paramName
-            if (!isAnonymous && !string.IsNullOrEmpty(parameterName))
+            if (!isAnonymous && !string.IsNullOrEmpty(rawParameterName))
             {
-                Debug.Assert(parameterName.Length <= 0xff, "parameter name can only be 255 bytes, shouldn't get to TdsParser!");
-                int tempLen = parameterName.Length & 0xff;
-                stateObj.WriteByte((byte)tempLen);
-                WriteString(parameterName, tempLen, 0, stateObj);
+                int nameLength = rawParameterName.Length;
+                int totalLength = nameLength;
+                bool writePrefix = false;
+                if (nameLength > 0)
+                {
+                    if (rawParameterName[0] != '@')
+                    {
+                        writePrefix = true;
+                        totalLength += 1;
+                    }
+                }
+                Debug.Assert(totalLength <= 0xff, "parameter name can only be 255 bytes, shouldn't get to TdsParser!");
+                stateObj.WriteByte((byte)(totalLength & 0xFF));
+                if (writePrefix)
+                {
+                    WriteString("@", 1, 0, stateObj);
+                }
+                WriteString(rawParameterName, nameLength, 0, stateObj);
             }
             else
             {
@@ -11242,7 +11294,7 @@ namespace Microsoft.Data.SqlClient
             WriteShort(0, stateObj);
             WriteInt(0, stateObj);
 
-            stateObj._pendingData = true;
+            stateObj.HasPendingData = true;
             stateObj._messageStatus = 0;
             return stateObj.WritePacket(TdsEnums.HARDFLUSH);
         }
@@ -13547,7 +13599,6 @@ namespace Microsoft.Data.SqlClient
         // Returns the actual chars read
         private bool TryReadPlpUnicodeCharsChunk(char[] buff, int offst, int len, TdsParserStateObject stateObj, out int charsRead)
         {
-
             Debug.Assert((buff == null && len == 0) || (buff.Length >= offst + len), "Invalid length sent to ReadPlpUnicodeChars()!");
             Debug.Assert((stateObj._longlen != 0) && (stateObj._longlen != TdsEnums.SQL_PLP_NULL),
                         "Out of sync plp read request");
@@ -13558,18 +13609,18 @@ namespace Microsoft.Data.SqlClient
                 return true;
             }
 
-            charsRead = len;
+            int charsToRead = len;
 
             // stateObj._longlenleft is in bytes
-            if ((stateObj._longlenleft >> 1) < (ulong)len)
-                charsRead = (int)(stateObj._longlenleft >> 1);
-
-            for (int ii = 0; ii < charsRead; ii++)
+            if ((stateObj._longlenleft / 2) < (ulong)len)
             {
-                if (!stateObj.TryReadChar(out buff[offst + ii]))
-                {
-                    return false;
-                }
+                charsToRead = (int)(stateObj._longlenleft >> 1);
+            }
+
+            if (!stateObj.TryReadChars(buff, offst, charsToRead, out charsRead))
+            {
+                charsRead = 0;
+                return false;
             }
 
             stateObj._longlenleft -= ((ulong)charsRead << 1);

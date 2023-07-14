@@ -24,7 +24,7 @@ namespace Microsoft.Data.SqlClient.SNI
         private static readonly SNIProxy s_singleton = new SNIProxy();
 
         internal static SNIProxy Instance => s_singleton;
-
+#if !NET7_0_OR_GREATER 
         /// <summary>
         /// Generate SSPI context
         /// </summary>
@@ -105,11 +105,11 @@ namespace Microsoft.Data.SqlClient.SNI
                 // so we don't need to check for a GssApiException here.
                 if (statusCode.ErrorCode == SecurityStatusPalErrorCode.InternalError)
                 {
-                    throw new InvalidOperationException(SQLMessage.KerberosTicketMissingError() + "\n" + statusCode);
+                    throw new InvalidOperationException(SQLMessage.KerberosTicketMissingError() + Environment.NewLine + statusCode);
                 }
                 else
                 {
-                    throw new InvalidOperationException(SQLMessage.SSPIGenerateError() + "\n" + statusCode);
+                    throw new InvalidOperationException(SQLMessage.SSPIGenerateError() + Environment.NewLine + statusCode);
                 }
             }
         }
@@ -125,7 +125,7 @@ namespace Microsoft.Data.SqlClient.SNI
                 errorCode != SecurityStatusPalErrorCode.CredentialsNeeded &&
                 errorCode != SecurityStatusPalErrorCode.Renegotiate;
         }
-
+#endif
         /// <summary>
         /// Create a SNI connection handle
         /// </summary>
@@ -579,10 +579,12 @@ namespace Microsoft.Data.SqlClient.SNI
         private void InferLocalServerName()
         {
             // If Server name is empty or localhost, then use "localhost"
-            if (string.IsNullOrEmpty(ServerName) || IsLocalHost(ServerName))
+            if (string.IsNullOrEmpty(ServerName) || IsLocalHost(ServerName) ||
+                (Environment.MachineName.Equals(ServerName, StringComparison.CurrentCultureIgnoreCase) &&
+                 _connectionProtocol == Protocol.Admin))
             {
-                ServerName = _connectionProtocol == Protocol.Admin ?
-                    Environment.MachineName : DefaultHostName;
+                // For DAC use "localhost" instead of the server name.
+                ServerName = DefaultHostName;
             }
         }
 
@@ -673,7 +675,7 @@ namespace Microsoft.Data.SqlClient.SNI
         private bool InferNamedPipesInformation()
         {
             // If we have a datasource beginning with a pipe or we have already determined that the protocol is Named Pipe
-            if (_dataSourceAfterTrimmingProtocol.StartsWith(PipeBeginning) || _connectionProtocol == Protocol.NP)
+            if (_dataSourceAfterTrimmingProtocol.StartsWith(PipeBeginning, StringComparison.Ordinal) || _connectionProtocol == Protocol.NP)
             {
                 // If the data source is "np:servername"
                 if (!_dataSourceAfterTrimmingProtocol.Contains(PipeBeginning))
@@ -712,7 +714,7 @@ namespace Microsoft.Data.SqlClient.SNI
                         return false;
                     }
 
-                    if (tokensByBackSlash[4].StartsWith(NamedPipeInstanceNameHeader))
+                    if (tokensByBackSlash[4].StartsWith(NamedPipeInstanceNameHeader, StringComparison.Ordinal))
                     {
                         InstanceName = tokensByBackSlash[4].Substring(NamedPipeInstanceNameHeader.Length);
                     }
