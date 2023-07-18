@@ -15,14 +15,7 @@
   <ItemGroup>
     <Compile Include="Microsoft.Data.SqlClient.cs" />
     <Compile Include="Microsoft.Data.SqlClient.Manual.cs" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(TargetGroup)' == 'netstandard'">
     <Compile Include="..\..\ref\System.Data.Common.Batch.cs" />
-  </ItemGroup>
-  <ItemGroup Condition="'$(TargetGroup)' == 'netstandard' AND $(TargetNetStandardVersion)=='netstandard2.1'">
-    <Compile Include="..\..\ref\System.Data.Common.Batch.IAsyncDisposable.cs" />    
-  </ItemGroup>  
-  <ItemGroup>
     <Compile Include="..\..\ref\Microsoft.Data.SqlClient.Batch.cs" />
     <Compile Include="..\..\ref\Microsoft.Data.SqlClient.Batch.NetCoreApp.cs" />
   </ItemGroup>

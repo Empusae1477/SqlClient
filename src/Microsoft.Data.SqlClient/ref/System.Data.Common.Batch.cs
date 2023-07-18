@@ -2,9 +2,18 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
+#if NETSTANDARD || NETFRAMEWORK
 namespace System.Data.Common
 {
 #pragma warning disable CS1591 // Missing XML comment for publicly visible type or member
+
+#if NETSTANDARD2_1_OR_GREATER
+    public abstract partial class DbBatch : System.IAsyncDisposable
+    {
+        public virtual Threading.Tasks.ValueTask DisposeAsync() { throw null; }
+    }
+#endif
+
     public abstract partial class DbBatch : System.IDisposable
     {
         public System.Data.Common.DbBatchCommandCollection BatchCommands { get { throw null!; } }
@@ -60,3 +69,4 @@ namespace System.Data.Common
 
 #pragma warning restore CS1591 // Missing XML comment for publicly visible type or member
 }
+#endif
