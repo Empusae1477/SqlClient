@@ -890,7 +890,11 @@ SqlDecimal sqlValue = new(_value._numericInfo._precision, _value._numericInfo._s
                     {
                         return SqlMoney.Null;
                     }
+#if NETCOREAPP && NET7_0_OR_GREATER
+                    return SqlMoney.FromTdsValue(_value._int64);
+#else
                     return SqlTypeWorkarounds.SqlMoneyCtor(_value._int64, 1/*ignored*/);
+#endif
                 }
                 return (SqlMoney)SqlValue; // anything else we haven't thought of goes through boxing.
             }

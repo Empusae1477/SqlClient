@@ -10,6 +10,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Data.ProviderBase;
 
 namespace Microsoft.Data.SqlClient.SNI
 {
@@ -29,11 +30,11 @@ namespace Microsoft.Data.SqlClient.SNI
         /// </summary>
         /// <param name="browserHostName">SQL Sever Browser hostname</param>
         /// <param name="instanceName">instance name to find port number</param>
-        /// <param name="timerExpire">Connection timer expiration</param>
+        /// <param name="timeout">Connection timer expiration</param>
         /// <param name="allIPsInParallel">query all resolved IP addresses in parallel</param>
         /// <param name="ipPreference">IP address preference</param>
         /// <returns>port number for given instance name</returns>
-        internal static int GetPortByInstanceName(string browserHostName, string instanceName, long timerExpire, bool allIPsInParallel, SqlConnectionIPAddressPreference ipPreference)
+        internal static int GetPortByInstanceName(string browserHostName, string instanceName, TimeoutTimer timeout, bool allIPsInParallel, SqlConnectionIPAddressPreference ipPreference)
         {
             Debug.Assert(!string.IsNullOrWhiteSpace(browserHostName), "browserHostName should not be null, empty, or whitespace");
             Debug.Assert(!string.IsNullOrWhiteSpace(instanceName), "instanceName should not be null, empty, or whitespace");
@@ -43,12 +44,18 @@ namespace Microsoft.Data.SqlClient.SNI
                 byte[] responsePacket = null;
                 try
                 {
-                    responsePacket = SendUDPRequest(browserHostName, SqlServerBrowserPort, instanceInfoRequest, timerExpire, allIPsInParallel, ipPreference);
+                    responsePacket = SendUDPRequest(browserHostName, SqlServerBrowserPort, instanceInfoRequest, timeout, allIPsInParallel, ipPreference);
                 }
                 catch (SocketException se)
                 {
+                    // A SocketException is possible for an instance name that doesn't exist.
+                    // If there are multiple IP addresses and one of them fails with a SocketException but
+                    // others simply don't respond because the instance name is invalid, we want to return
+                    // the same error as if the response was empty. The higher error suits all scenarios.
+                    // But log it, just in case there is a different, underlying issue that support needs
+                    // to troubleshoot.
                     SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.ERR, "SocketException Message = {0}", args0: se?.Message);
-                    throw new Exception(SQLMessage.SqlServerBrowserNotAccessible(), se);
+                    throw;
                 }
 
                 const byte SvrResp = 0x05;
@@ -98,17 +105,17 @@ namespace Microsoft.Data.SqlClient.SNI
         /// </summary>
         /// <param name="browserHostName">SQL Sever Browser hostname</param>
         /// <param name="instanceName">instance name to lookup DAC port</param>
-        /// <param name="timerExpire">Connection timer expiration</param>
+        /// <param name="timeout">Connection timer expiration</param>
         /// <param name="allIPsInParallel">query all resolved IP addresses in parallel</param>
         /// <param name="ipPreference">IP address preference</param>
         /// <returns>DAC port for given instance name</returns>
-        internal static int GetDacPortByInstanceName(string browserHostName, string instanceName, long timerExpire, bool allIPsInParallel, SqlConnectionIPAddressPreference ipPreference)
+        internal static int GetDacPortByInstanceName(string browserHostName, string instanceName, TimeoutTimer timeout, bool allIPsInParallel, SqlConnectionIPAddressPreference ipPreference)
         {
             Debug.Assert(!string.IsNullOrWhiteSpace(browserHostName), "browserHostName should not be null, empty, or whitespace");
             Debug.Assert(!string.IsNullOrWhiteSpace(instanceName), "instanceName should not be null, empty, or whitespace");
 
             byte[] dacPortInfoRequest = CreateDacPortInfoRequest(instanceName);
-            byte[] responsePacket = SendUDPRequest(browserHostName, SqlServerBrowserPort, dacPortInfoRequest, timerExpire, allIPsInParallel, ipPreference);
+            byte[] responsePacket = SendUDPRequest(browserHostName, SqlServerBrowserPort, dacPortInfoRequest, timeout, allIPsInParallel, ipPreference);
 
             const byte SvrResp = 0x05;
             const byte ProtocolVersion = 0x01;
@@ -157,11 +164,11 @@ namespace Microsoft.Data.SqlClient.SNI
         /// <param name="browserHostname">UDP server hostname</param>
         /// <param name="port">UDP server port</param>
         /// <param name="requestPacket">request packet</param>
-        /// <param name="timerExpire">Connection timer expiration</param>
+        /// <param name="timeout">Connection timer expiration</param>
         /// <param name="allIPsInParallel">query all resolved IP addresses in parallel</param>
         /// <param name="ipPreference">IP address preference</param>
         /// <returns>response packet from UDP server</returns>
-        private static byte[] SendUDPRequest(string browserHostname, int port, byte[] requestPacket, long timerExpire, bool allIPsInParallel, SqlConnectionIPAddressPreference ipPreference)
+        private static byte[] SendUDPRequest(string browserHostname, int port, byte[] requestPacket, TimeoutTimer timeout, bool allIPsInParallel, SqlConnectionIPAddressPreference ipPreference)
         {
             using (TrySNIEventScope.Create(nameof(SSRP)))
             {
@@ -180,16 +187,10 @@ namespace Microsoft.Data.SqlClient.SNI
                         return null;
                 }
 
-                TimeSpan ts = default;
-                // In case the Timeout is Infinite, we will receive the max value of Int64 as the tick count
-                // The infinite Timeout is a function of ConnectionString Timeout=0
-                if (long.MaxValue != timerExpire)
-                {
-                    ts = DateTime.FromFileTime(timerExpire) - DateTime.Now;
-                    ts = ts.Ticks < 0 ? TimeSpan.FromTicks(0) : ts;
-                }
+                IPAddress[] ipAddresses = timeout.IsInfinite
+                    ? SNICommon.GetDnsIpAddresses(browserHostname)
+                    : SNICommon.GetDnsIpAddresses(browserHostname, timeout);
 
-                IPAddress[] ipAddresses = SNICommon.GetDnsIpAddresses(browserHostname);
                 Debug.Assert(ipAddresses.Length > 0, "DNS should throw if zero addresses resolve");
                 IPAddress[] ipv4Addresses = null;
                 IPAddress[] ipv6Addresses = null;
@@ -345,9 +346,37 @@ namespace Microsoft.Data.SqlClient.SNI
                     }
                 }
             }
+            catch (AggregateException ae)
+            {
+                if (ae.InnerExceptions.Count > 0)
+                {
+                    // Log all errors
+                    foreach (Exception e in ae.InnerExceptions)
+                    {
+                        // Favor SocketException for returned error
+                        if (e is SocketException)
+                        {
+                            result.Error = e;
+                        }
+                        SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.INFO,
+                            "SendUDPRequest ({0}) resulted in exception: {1}", args0: endPoint.ToString(), args1: e.Message);
+                    }
+
+                    // Return first error if we didn't find a SocketException
+                    result.Error = result.Error == null ? ae.InnerExceptions[0] : result.Error;
+                }
+                else
+                {
+                    result.Error = ae;
+                    SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.INFO,
+                        "SendUDPRequest ({0}) resulted in exception: {1}", args0: endPoint.ToString(), args1: ae.Message);
+                }
+            }
             catch (Exception e)
             {
                 result.Error = e;
+                SqlClientEventSource.Log.TrySNITraceEvent(nameof(SSRP), EventType.INFO,
+                    "SendUDPRequest ({0}) resulted in exception: {1}", args0: endPoint.ToString(), args1: e.Message);
             }
 
             return result;
